@@ -11,6 +11,7 @@ from ebooklib import epub
 from bs4 import BeautifulSoup
 from docx import Document
 import nltk
+from tqdm import tqdm
 
 # --- Project Directory Setup ---
 # Get the project root directory (parent of src/)
@@ -698,6 +699,77 @@ def cleanup_gcs_file(gcs_uri):
     except Exception as e:
         logger.warning(f"Could not cleanup GCS file: {e}")
 
+def estimate_cost(chapters_list, voice_name):
+    """
+    Estimate the cost of generating audiobook based on character count.
+
+    Args:
+        chapters_list: List of (title, text, chapter_num, original_title) tuples
+        voice_name: Name of the voice being used
+
+    Returns:
+        Dictionary with character count, estimated cost, and duration
+    """
+    # Count total characters
+    total_chars = sum(len(text) for _, text, _, _ in chapters_list)
+
+    # Pricing per million characters (as of 2024)
+    voice_pricing = {
+        'Standard': 4.00,
+        'WaveNet': 16.00,
+        'Neural2': 16.00,
+        'Chirp3-HD': 16.00,  # Premium tier
+        'Studio': 16.00,
+    }
+
+    # Determine voice type from voice_name
+    voice_type = 'Standard'  # Default
+    if 'Chirp3-HD' in voice_name or 'Chirp' in voice_name:
+        voice_type = 'Chirp3-HD'
+    elif 'Neural2' in voice_name:
+        voice_type = 'Neural2'
+    elif 'WaveNet' in voice_name:
+        voice_type = 'WaveNet'
+    elif 'Studio' in voice_name:
+        voice_type = 'Studio'
+
+    price_per_million = voice_pricing.get(voice_type, 16.00)
+    estimated_cost = (total_chars / 1_000_000) * price_per_million
+
+    # Estimate duration (rough approximation: ~1000 chars per minute of audio)
+    duration_minutes = total_chars / 1000
+    duration_hours = duration_minutes / 60
+
+    return {
+        'total_characters': total_chars,
+        'voice_type': voice_type,
+        'price_per_million': price_per_million,
+        'estimated_cost': estimated_cost,
+        'duration_minutes': duration_minutes,
+        'duration_hours': duration_hours,
+        'chapter_count': len(chapters_list)
+    }
+
+def print_cost_estimate(estimate):
+    """Pretty print the cost estimate."""
+    print(f"\n{'='*60}")
+    print(f"📊 COST ESTIMATE")
+    print(f"{'='*60}")
+    print(f"📖 Chapters: {estimate['chapter_count']}")
+    print(f"📝 Characters: {estimate['total_characters']:,}")
+    print(f"🎙️ Voice type: {estimate['voice_type']} (${estimate['price_per_million']:.2f}/million chars)")
+    print(f"💰 Estimated cost: ${estimate['estimated_cost']:.2f}")
+
+    # Format duration nicely
+    if estimate['duration_hours'] >= 1:
+        hours = int(estimate['duration_hours'])
+        minutes = int((estimate['duration_hours'] - hours) * 60)
+        print(f"⏱️  Estimated duration: ~{hours}h {minutes}m")
+    else:
+        print(f"⏱️  Estimated duration: ~{int(estimate['duration_minutes'])}m")
+
+    print(f"{'='*60}\n")
+
 # --- Main execution ---
 if __name__ == "__main__":
     # Create local output directory if it doesn't exist (already created above, but double-check)
@@ -737,7 +809,17 @@ if __name__ == "__main__":
             exit()
         
         logger.info(f"Found {len(chapters_list)} chapters")
-        
+
+        # Show cost estimate
+        cost_estimate = estimate_cost(chapters_list, voice_name)
+        print_cost_estimate(cost_estimate)
+
+        # Ask if user wants to proceed
+        proceed = input("⚠️  Proceed with audiobook generation? (y/n): ").strip().lower()
+        if proceed not in ['y', 'yes']:
+            print("Cancelled by user.")
+            exit()
+
         # Let user select which chapters to process
         selected_indices = select_chapters_to_process(chapters_list)
         
@@ -748,29 +830,37 @@ if __name__ == "__main__":
         # Process selected chapters with enhanced tracking
         print(f"\n🎵 Starting audio synthesis for {len(selected_indices)} chapters...")
         print("="*60)
-        
+
         successful_chapters = 0
         skipped_chapters = []
         gcs_uris_and_filenames = []
-        
-        for processing_order, chapter_index in enumerate(selected_indices, 1):
-            title, text_content, chapter_num, original_title = chapters_list[chapter_index]
-            
-            print(f"\n[{processing_order}/{len(selected_indices)}] Processing chapter...")
-            
-            gcs_uri, final_filename = enhanced_synthesize_long_audio(
-                title, text_content, chapter_num, original_title,
-                audiobook_base_name, processing_order, gcs_bucket_name,
-                project_id, location, voice_name, voice_language_code
-            )
-            
-            if gcs_uri and final_filename:
-                gcs_uris_and_filenames.append((gcs_uri, final_filename))
-                successful_chapters += 1
-                logger.info(f"✅ Chapter {processing_order} completed successfully")
-            else:
-                skipped_chapters.append((processing_order, original_title))
-                logger.error(f"❌ Chapter {processing_order} was skipped: '{original_title}'")
+
+        # Use tqdm for progress bar
+        with tqdm(total=len(selected_indices), desc="🎧 Processing", unit="chapter",
+                  bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+
+            for processing_order, chapter_index in enumerate(selected_indices, 1):
+                title, text_content, chapter_num, original_title = chapters_list[chapter_index]
+
+                # Update progress bar with current chapter name
+                pbar.set_postfix_str(f"{original_title[:40]}...")
+
+                gcs_uri, final_filename = enhanced_synthesize_long_audio(
+                    title, text_content, chapter_num, original_title,
+                    audiobook_base_name, processing_order, gcs_bucket_name,
+                    project_id, location, voice_name, voice_language_code
+                )
+
+                if gcs_uri and final_filename:
+                    gcs_uris_and_filenames.append((gcs_uri, final_filename))
+                    successful_chapters += 1
+                    logger.info(f"✅ Chapter {processing_order} completed successfully")
+                else:
+                    skipped_chapters.append((processing_order, original_title))
+                    logger.error(f"❌ Chapter {processing_order} was skipped: '{original_title}'")
+
+                # Update progress bar
+                pbar.update(1)
         
         print("="*60)
         print(f"✅ Successfully synthesized {successful_chapters}/{len(selected_indices)} chapters")
@@ -785,12 +875,17 @@ if __name__ == "__main__":
             # Download all generated audio files
             print(f"\n📥 Downloading audio files...")
             successful_downloads = 0
-            
-            for gcs_uri, final_filename in gcs_uris_and_filenames:
-                local_path = download_from_gcs(gcs_uri, local_output_directory, final_filename)
-                if local_path:
-                    successful_downloads += 1
-                    cleanup_gcs_file(gcs_uri)
+
+            with tqdm(total=len(gcs_uris_and_filenames), desc="💾 Downloading", unit="file",
+                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
+
+                for gcs_uri, final_filename in gcs_uris_and_filenames:
+                    pbar.set_postfix_str(f"{final_filename}")
+                    local_path = download_from_gcs(gcs_uri, local_output_directory, final_filename)
+                    if local_path:
+                        successful_downloads += 1
+                        cleanup_gcs_file(gcs_uri)
+                    pbar.update(1)
             
             print(f"\n🎉 Process Complete!")
             print(f"📊 Successfully downloaded: {successful_downloads}/{len(gcs_uris_and_filenames)} files")
