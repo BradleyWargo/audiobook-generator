@@ -1,0 +1,6 @@
+google-cloud-texttospeech
+google-cloud-storage
+ebooklib
+beautifulsoup4
+python-docx
+nltk

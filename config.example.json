@@ -1,0 +1,39 @@
+{
+    "note": "This is a reference config - actual configuration is done in src/audiobook_generator.py",
+    "paths": {
+        "credentials_file": "credentials/audiobook-generator-tts-service-account.json",
+        "input_file": "input/your-book.epub",
+        "output_directory": "output/",
+        "logs_directory": "logs/"
+    },
+    "google_cloud": {
+        "project_id": "your-project-id",
+        "bucket_name": "your-bucket-name",
+        "location": "global"
+    },
+    "voice_settings": {
+        "language_code": "en-GB",
+        "voice_name": "en-GB-Chirp3-HD-Despina",
+        "audio_encoding": "LINEAR16",
+        "available_voices": {
+            "en-US-male": "en-US-Chirp3-HD-Umbriel",
+            "en-US-female": "en-US-Chirp3-HD-Despina",
+            "en-GB-male": "en-GB-Chirp3-HD-Umbriel",
+            "en-GB-female": "en-GB-Chirp3-HD-Despina",
+            "es-US-male": "es-US-Chirp3-HD-Enceladus",
+            "ko-KR-male": "ko-KR-Chirp3-HD-Umbriel",
+            "ja-JP-male": "ja-JP-Chirp3-HD-Umbriel"
+        }
+    },
+    "processing": {
+        "chapter_heading_style": "Heading 1",
+        "max_sentence_length": 200,
+        "max_chunk_length": 180,
+        "max_timeout": 1800,
+        "retry_attempts": 3,
+        "supported_formats": [
+            "epub",
+            "docx"
+        ]
+    }
+}

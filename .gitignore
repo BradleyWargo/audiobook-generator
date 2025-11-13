@@ -1,0 +1,41 @@
+# Credentials & Secrets
+credentials/*.json
+!credentials/.gitkeep
+src/config_local.py
+
+# Logs
+*.log
+logs/*.log
+!logs/.gitkeep
+
+# Output & Generated Files
+output/*.wav
+output/*.mp3
+output/**/*.wav
+output/**/*.mp3
+!output/.gitkeep
+
+# Input files (user's ebooks)
+input/*.epub
+input/*.docx
+input/*.pdf
+!input/.gitkeep
+!input/README.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# NLTK data
+nltk_data/
+
+# Old output folder name
+Audiobook Output/
