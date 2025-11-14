@@ -2,17 +2,27 @@
 Main application window for Audiobook Generator
 """
 import sys
+import logging
 from pathlib import Path
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QPushButton,
-                               QLabel, QMessageBox, QProgressDialog, QMenuBar,
+                               QLabel, QMessageBox, QMenuBar,
                                QStatusBar, QHBoxLayout, QGroupBox)
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 
 # Import components
 from gui.components.file_uploader import FileUploader
 from gui.components.voice_selector import VoiceSelector
 from gui.components.chapter_list import ChapterList
+from gui.setup_wizard import SetupWizard
+from gui.progress_dialog import ProgressDialog, ConversionThread
+
+# Import core
+from core.config import ConfigManager
+from core.engine import AudiobookEngine
+from core.parser import EbookParser
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -20,17 +30,34 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+
+        # Initialize configuration and engine
+        self.config = ConfigManager()
+        self.engine = AudiobookEngine(self.config)
+        self.parser = EbookParser()
+
+        # State
         self.current_file = None
         self.chapters = []
-        self.language_code = 'en-GB'
-        self.voice_name = 'en-GB-Chirp3-HD-Despina'
+
+        # UI setup
         self.setup_ui()
         self.create_menu_bar()
         self.create_status_bar()
 
+        # Restore window geometry
+        geometry = self.config.get_window_geometry()
+        if geometry:
+            self.restoreGeometry(geometry)
+
+        # Show setup wizard if needed
+        if self.config.get_show_setup_wizard_on_start():
+            if not self.config.is_google_cloud_configured():
+                self.show_setup_wizard()
+
     def setup_ui(self):
         """Set up the user interface"""
-        self.setWindowTitle("Audiobook Generator - PROTOTYPE")
+        self.setWindowTitle("Audiobook Generator")
         self.setMinimumSize(700, 800)
 
         # Central widget
@@ -108,20 +135,14 @@ class MainWindow(QMainWindow):
         self.generate_btn.clicked.connect(self.on_generate_clicked)
         main_layout.addWidget(self.generate_btn)
 
-        # Setup notice
-        setup_notice = QLabel(
-            "⚠️ PROTOTYPE: This demo only extracts chapters. "
-            "Full version requires Google Cloud API credentials."
-        )
-        setup_notice.setStyleSheet("""
-            background-color: #fff3cd;
-            color: #856404;
-            padding: 10px;
-            border-radius: 5px;
-            font-size: 11px;
-        """)
-        setup_notice.setWordWrap(True)
-        main_layout.addWidget(setup_notice)
+        # Setup status notice
+        self.setup_notice = QLabel("")
+        self.setup_notice.setWordWrap(True)
+        self.setup_notice.setVisible(False)
+        main_layout.addWidget(self.setup_notice)
+
+        # Update setup notice based on configuration
+        self.update_setup_notice()
 
         central_widget.setLayout(main_layout)
 
@@ -144,6 +165,25 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
+        # Edit menu
+        edit_menu = menubar.addMenu("Edit")
+
+        settings_action = QAction("Preferences...", self)
+        settings_action.setShortcut("Ctrl+,")
+        settings_action.triggered.connect(self.show_preferences)
+        edit_menu.addAction(settings_action)
+
+        # Tools menu
+        tools_menu = menubar.addMenu("Tools")
+
+        setup_action = QAction("Run Setup Wizard...", self)
+        setup_action.triggered.connect(self.show_setup_wizard)
+        tools_menu.addAction(setup_action)
+
+        test_connection_action = QAction("Test Google Cloud Connection", self)
+        test_connection_action.triggered.connect(self.test_connection)
+        tools_menu.addAction(test_connection_action)
+
         # Help menu
         help_menu = menubar.addMenu("Help")
 
@@ -162,20 +202,19 @@ class MainWindow(QMainWindow):
         self.current_file = file_path
         self.status_bar.showMessage(f"Loading: {Path(file_path).name}...")
 
-        try:
-            # Import the chapter extraction functions
-            sys.path.insert(0, str(Path(__file__).parent.parent))
-            from audiobook_generator import extract_chapters, get_file_type
+        # Save last used directory
+        self.config.set_last_input_directory(str(Path(file_path).parent))
 
-            # Extract chapters
-            file_type = get_file_type(file_path)
-            self.chapters = list(extract_chapters(file_path, file_type))
+        try:
+            # Extract chapters using engine
+            self.chapters = self.engine.extract_chapters(file_path)
 
             if not self.chapters:
                 QMessageBox.warning(
                     self,
                     "No Chapters Found",
-                    f"Could not find any chapters in the selected {file_type.upper()} file."
+                    f"Could not find any chapters in the selected file.\n\n"
+                    f"For DOCX files, make sure chapters use 'Heading 1' style."
                 )
                 self.status_bar.showMessage("No chapters found.")
                 return
@@ -186,14 +225,19 @@ class MainWindow(QMainWindow):
             # Update cost estimate
             self.update_cost_estimate()
 
-            # Enable generate button
-            self.generate_btn.setEnabled(True)
+            # Enable generate button only if Google Cloud is configured
+            if self.config.is_google_cloud_configured():
+                self.generate_btn.setEnabled(True)
+            else:
+                self.generate_btn.setEnabled(False)
+                self.update_setup_notice()
 
             self.status_bar.showMessage(
                 f"Loaded {len(self.chapters)} chapters from {Path(file_path).name}"
             )
 
         except Exception as e:
+            logger.error(f"Error loading file: {e}")
             QMessageBox.critical(
                 self,
                 "Error Loading File",
@@ -203,8 +247,10 @@ class MainWindow(QMainWindow):
 
     def on_voice_changed(self, language_code: str, voice_name: str):
         """Handle voice selection change"""
-        self.language_code = language_code
-        self.voice_name = voice_name
+        # Save to config
+        self.config.set_voice_language(language_code)
+        self.config.set_voice_name(voice_name)
+
         self.update_cost_estimate()
         self.status_bar.showMessage(f"Voice changed to: {voice_name}")
 
@@ -224,40 +270,44 @@ class MainWindow(QMainWindow):
             self.cost_label.setText("No chapters selected")
             return
 
-        # Calculate total characters
-        total_chars = sum(len(text) for _, text, _, _ in selected_chapters)
-
-        # Pricing (per million characters)
-        voice_type = "Chirp3-HD" if "Chirp3-HD" in self.voice_name else "Neural2"
-        price_per_million = 16.00  # Both Chirp3-HD and Neural2
-
-        # Calculate cost
-        estimated_cost = (total_chars / 1_000_000) * price_per_million
-
-        # Estimate duration (rough: ~1000 chars per minute of audio)
-        duration_minutes = total_chars / 1000
-        duration_hours = duration_minutes / 60
+        # Use engine to estimate cost
+        voice_name = self.config.get_voice_name()
+        estimate = self.engine.estimate_cost(selected_chapters, voice_name)
 
         # Format duration
+        duration_hours = estimate['duration_hours']
         if duration_hours >= 1:
             hours = int(duration_hours)
             minutes = int((duration_hours - hours) * 60)
             duration_str = f"~{hours}h {minutes}m"
         else:
-            duration_str = f"~{int(duration_minutes)}m"
+            duration_str = f"~{int(estimate['duration_minutes'])}m"
 
         # Update label
         self.cost_label.setText(
-            f"💰 Estimated cost: ${estimated_cost:.2f} | "
+            f"💰 Estimated cost: ${estimate['estimated_cost']:.2f} | "
             f"⏱️ Duration: {duration_str} | "
-            f"📝 {total_chars:,} characters"
+            f"📝 {estimate['total_characters']:,} characters"
         )
 
     def on_generate_clicked(self):
         """Handle generate button click"""
-        selected = self.chapter_list.get_selected_chapters()
+        # Check if Google Cloud is configured
+        if not self.config.is_google_cloud_configured():
+            reply = QMessageBox.question(
+                self,
+                "Setup Required",
+                "Google Cloud is not configured yet.\n\n"
+                "Would you like to run the setup wizard now?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.show_setup_wizard()
+            return
 
-        if not selected:
+        selected_indices = self.chapter_list.get_selected_indices()
+
+        if not selected_indices:
             QMessageBox.warning(
                 self,
                 "No Chapters Selected",
@@ -265,63 +315,205 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Show info dialog (prototype)
+        # Get selected chapters info for display
+        selected_chapters = self.chapter_list.get_selected_chapters()
+        chapter_titles = [original_title for _, _, _, original_title in selected_chapters]
+
+        # Determine output base name
+        output_base_name = self.config.get_output_base_name()
+        if self.config.get_use_book_title() and self.current_file:
+            # Use book filename as base
+            output_base_name = Path(self.current_file).stem
+
+        # Show confirmation dialog with cost estimate
+        estimate = self.engine.estimate_cost(selected_chapters)
+        reply = QMessageBox.question(
+            self,
+            "Confirm Conversion",
+            f"Ready to generate audiobook!\n\n"
+            f"📚 Chapters: {len(selected_indices)} selected\n"
+            f"💰 Estimated cost: ${estimate['estimated_cost']:.2f}\n"
+            f"⏱️ Estimated duration: {int(estimate['duration_hours'])}h {int((estimate['duration_hours'] % 1) * 60)}m of audio\n\n"
+            f"This will use your Google Cloud account.\n"
+            f"Continue?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        # Create and show progress dialog
+        progress_dialog = ProgressDialog(self)
+        progress_dialog.start_conversion(chapter_titles)
+
+        # Create conversion thread
+        self.conversion_thread = ConversionThread(
+            engine=self.engine,
+            chapters=self.chapters,
+            selected_indices=selected_indices,
+            output_base_name=output_base_name,
+            parent=self
+        )
+
+        # Connect signals
+        self.conversion_thread.progress.connect(progress_dialog.update_progress)
+        self.conversion_thread.finished.connect(
+            lambda succ, fail: self.on_conversion_complete(progress_dialog, succ, fail)
+        )
+        self.conversion_thread.error.connect(
+            lambda msg: self.on_conversion_error(progress_dialog, msg)
+        )
+
+        # Start conversion
+        self.conversion_thread.start()
+        progress_dialog.exec()
+
+    def on_conversion_complete(self, dialog, successful, failed):
+        """Handle conversion completion"""
+        dialog.conversion_complete(successful, failed)
+
+        if successful > 0:
+            output_dir = self.config.get_output_directory()
+            QMessageBox.information(
+                self,
+                "Conversion Complete",
+                f"🎉 Audiobook generation complete!\n\n"
+                f"✅ Success: {successful} chapters\n"
+                f"❌ Failed: {failed} chapters\n\n"
+                f"📁 Files saved to:\n{output_dir}"
+            )
+
+    def on_conversion_error(self, dialog, error_msg):
+        """Handle conversion error"""
+        QMessageBox.critical(
+            dialog,
+            "Conversion Error",
+            f"An error occurred during conversion:\n\n{error_msg}"
+        )
+        dialog.accept()
+
+    def show_setup_wizard(self):
+        """Show Google Cloud setup wizard"""
+        wizard = SetupWizard(self.config, self)
+        if wizard.exec():
+            # Setup complete, update UI
+            self.update_setup_notice()
+            if self.chapters:
+                self.generate_btn.setEnabled(True)
+            QMessageBox.information(
+                self,
+                "Setup Complete",
+                "Google Cloud has been configured successfully!\n\n"
+                "You can now convert ebooks to audiobooks."
+            )
+
+    def show_preferences(self):
+        """Show preferences window"""
+        # TODO: Implement preferences window
         QMessageBox.information(
             self,
-            "Prototype Limitation",
-            f"🎉 Great! This prototype successfully:\n\n"
-            f"✅ Loaded your ebook\n"
-            f"✅ Extracted {len(self.chapters)} chapters\n"
-            f"✅ You selected {len(selected)} chapters\n"
-            f"✅ Calculated cost estimate\n\n"
-            f"🚀 Full Version Features:\n"
-            f"• Google Cloud API integration\n"
-            f"• Batch audiobook generation\n"
-            f"• Progress tracking\n"
-            f"• Audio file download\n\n"
-            f"💡 Selected voice: {self.voice_name}\n"
-            f"💰 Estimated cost: See above\n\n"
-            f"To enable full conversion, you'll need:\n"
-            f"1. Google Cloud account (free tier available)\n"
-            f"2. Text-to-Speech API enabled\n"
-            f"3. Service account credentials\n\n"
-            f"The full app will guide you through setup!"
+            "Preferences",
+            "Preferences window coming soon!\n\n"
+            "For now, you can:\n"
+            "• Run Setup Wizard (Tools menu)\n"
+            "• Test Connection (Tools menu)"
         )
+
+    def test_connection(self):
+        """Test Google Cloud connection"""
+        if not self.config.is_google_cloud_configured():
+            QMessageBox.warning(
+                self,
+                "Not Configured",
+                "Google Cloud is not configured yet.\n\n"
+                "Please run the setup wizard first."
+            )
+            return
+
+        self.status_bar.showMessage("Testing connection...")
+        success, message = self.engine.test_google_cloud_connection()
+
+        if success:
+            QMessageBox.information(
+                self,
+                "Connection Successful",
+                f"✅ {message}\n\nYour Google Cloud setup is working correctly!"
+            )
+            self.status_bar.showMessage("Connection test passed")
+        else:
+            QMessageBox.critical(
+                self,
+                "Connection Failed",
+                f"❌ {message}\n\n"
+                f"Please check your configuration in the setup wizard."
+            )
+            self.status_bar.showMessage("Connection test failed")
+
+    def update_setup_notice(self):
+        """Update the setup notice based on configuration status"""
+        if self.config.is_google_cloud_configured():
+            self.setup_notice.setVisible(False)
+        else:
+            self.setup_notice.setText(
+                "⚠️ Google Cloud is not configured. "
+                "Click here or use Tools > Run Setup Wizard to get started."
+            )
+            self.setup_notice.setStyleSheet("""
+                background-color: #fff3cd;
+                color: #856404;
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 11px;
+            """)
+            self.setup_notice.setVisible(True)
+            self.setup_notice.mousePressEvent = lambda e: self.show_setup_wizard()
+            self.setup_notice.setCursor(Qt.PointingHandCursor)
 
     def show_about(self):
         """Show about dialog"""
         QMessageBox.about(
             self,
             "About Audiobook Generator",
-            "🎧 <b>Audiobook Generator (Prototype)</b><br><br>"
+            "🎧 <b>Audiobook Generator</b><br><br>"
             "Convert ebooks (EPUB, DOCX) to audiobooks using<br>"
             "Google Cloud Text-to-Speech API.<br><br>"
             "<b>Business Model:</b> BYOK (Bring Your Own Key)<br>"
-            "• You purchase the app ($39-49)<br>"
+            "• One-time purchase<br>"
             "• You use your own Google Cloud account<br>"
             "• You pay Google directly for usage (~$5-20/book)<br><br>"
             "<b>Features:</b><br>"
             "• Drag-and-drop file upload<br>"
-            "• Multiple high-quality voices<br>"
+            "• 100+ premium voices in 40+ languages<br>"
             "• Chapter-by-chapter selection<br>"
-            "• Cost estimation<br>"
-            "• Privacy-first (your data, your cloud)<br><br>"
-            "<b>Version:</b> 0.1.0 (Prototype)<br>"
-            "<b>Built with:</b> Python, PySide6<br><br>"
-            "© 2025 - Educational Prototype"
+            "• Real-time cost estimation<br>"
+            "• Privacy-first (your data, your cloud)<br>"
+            "• Batch processing<br><br>"
+            "<b>Version:</b> 1.0.0<br>"
+            "<b>Built with:</b> Python, PySide6, Google Cloud<br><br>"
+            "© 2025"
         )
 
     def closeEvent(self, event):
         """Handle window close event"""
-        reply = QMessageBox.question(
-            self,
-            "Confirm Exit",
-            "Are you sure you want to quit?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
+        # Save window geometry
+        self.config.set_window_geometry(self.saveGeometry())
 
-        if reply == QMessageBox.Yes:
-            event.accept()
+        # Confirm exit if conversion is running
+        if hasattr(self, 'conversion_thread') and self.conversion_thread.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "Conversion in Progress",
+                "A conversion is currently running.\n\n"
+                "Are you sure you want to quit? Progress will be lost.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+
+            if reply == QMessageBox.Yes:
+                self.conversion_thread.cancel()
+                self.conversion_thread.wait()  # Wait for thread to finish
+                event.accept()
+            else:
+                event.ignore()
         else:
-            event.ignore()
+            event.accept()
